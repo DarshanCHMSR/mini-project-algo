@@ -1,17 +1,8 @@
-"""
-Train and evaluate TCN, LSTM, and Logistic Regression baselines.
-
-Improvements for stronger defect detection:
-- Strict train-only normalization with fold-safe preprocessing
-- Held-out test set for final unbiased reporting
-- 5-fold StratifiedKFold on train/val pool
-- F1-driven threshold tuning for imbalanced classification
-- CV test-time ensembling for TCN and LSTM
-"""
-
 from __future__ import annotations
 
 import copy
+import pickle
+import os
 import random
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
@@ -33,7 +24,8 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from preprocess import TARGET_COL, load_raw_dataframe, preprocess_probays
-from tcn_model import FocalLoss, LSTMClassifier, TCNDefectClassifier
+from tcn_model import AsymmetricFocalLoss, LSTMClassifier, TCNDefectClassifier
+from explainer import GradCAMExplainer, plot_saliency_overlay
 
 
 # -----------------------------
@@ -204,7 +196,8 @@ def fit_neural_model(
     y_val: np.ndarray,
 ) -> Tuple[nn.Module, float, np.ndarray]:
     """Train neural model with requested optimizer/loss/scheduler/stopping."""
-    criterion = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA)
+    # Use AsymmetricFocalLoss with higher gamma_pos to penalize false negatives more
+    criterion = AsymmetricFocalLoss(gamma_neg=2.0, gamma_pos=4.0, alpha=0.75, clip=0.05)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -543,7 +536,8 @@ def main() -> None:
     )
 
     # Fix T_max using only trainval pool (no test leakage).
-    _, _, _, tv_stats = preprocess_probays(PARQUET_PATH, train_indices=trainval_indices)
+    # Call with save_artifacts=True to save norm_stats.pkl and raw_ts_cache.pkl
+    _, _, _, tv_stats = preprocess_probays(PARQUET_PATH, train_indices=trainval_indices, save_artifacts=True)
     t_max_trainval = int(tv_stats["t_max"])
     print(f"Using T_max={t_max_trainval} computed from trainval subset only")
 
@@ -622,6 +616,170 @@ def main() -> None:
     print("Model Comparison on Held-out Test Set")
     print("=" * 70)
     print(results.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+
+    # Save the best TCN model from the first fold for explain_single_cycle.py to use
+    best_model_path = "best_model.pt"
+    best_tcn = TCNDefectClassifier(
+        in_channels=IN_CHANNELS,
+        channel_list=CHANNEL_LIST,
+        kernel_size=KERNEL_SIZE,
+        n_scalar_feats=N_SCALAR_FEATS,
+        dropout=DROPOUT,
+    ).to(DEVICE)
+    best_tcn.load_state_dict(tcn_folds[0].model_state)
+    torch.save(best_tcn.state_dict(), best_model_path)
+    print(f"\nSaved best TCN model to {best_model_path}")
+
+    # =========================================================================
+    # EXPLAINABILITY ANALYSIS
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("EXPLAINABILITY ANALYSIS — GradCAM Temporal Saliency")
+    print("=" * 70)
+
+    # Load raw data for saliency analysis
+    df_full = load_raw_dataframe(PARQUET_PATH)
+    x_ts_full, x_scalar_full, y_full, norm_stats_final = preprocess_probays(
+        PARQUET_PATH,
+        train_indices=trainval_indices,
+    )
+
+    # Load raw time-series cache (needed for pressure and trigger arrays)
+    raw_cache_path = os.path.join(os.path.dirname(__file__), "raw_ts_cache.pkl")
+    if os.path.exists(raw_cache_path):
+        with open(raw_cache_path, "rb") as f:
+            raw_ts_cache = pickle.load(f)
+    else:
+        raw_ts_cache = {}
+
+    # Identify all defective cycles in the test set
+    y_test_full = y_all[test_indices].astype(int)
+    defective_mask = y_test_full == 1
+    defective_test_indices_local = np.where(defective_mask)[0]
+    defective_test_indices_global = test_indices[defective_test_indices_local]
+
+    # Create a best model from the first fold for explainability
+    best_tcn_fold = tcn_folds[0]
+    model_explain = TCNDefectClassifier(
+        in_channels=IN_CHANNELS,
+        channel_list=CHANNEL_LIST,
+        kernel_size=KERNEL_SIZE,
+        n_scalar_feats=N_SCALAR_FEATS,
+        dropout=DROPOUT,
+    ).to(DEVICE)
+    model_explain.load_state_dict(best_tcn_fold.model_state)
+
+    # Get cycle IDs from dataframe
+    cycle_ids = df_full["MET_MachineCycleID"].astype(str).values if "MET_MachineCycleID" in df_full.columns else [str(i) for i in range(len(df_full))]
+
+    # Saliency peak times and phase-wise statistics
+    saliency_peak_times_sec = []
+    saliency_inj_means = []
+    saliency_hld_means = []
+    saliency_cool_means = []
+
+    for local_idx, global_idx in enumerate(defective_test_indices_global):
+        cycle_id = cycle_ids[global_idx]
+
+        # Get sample tensors
+        x_ts_sample = x_ts_full[global_idx:global_idx+1].to(DEVICE)
+        x_scalar_sample = x_scalar_full[global_idx:global_idx+1].to(DEVICE)
+        # Enable gradients for explainability
+        x_ts_sample.requires_grad_(True)
+
+        # Instantiate explainer
+        explainer = GradCAMExplainer(model_explain)
+        saliency = explainer.explain(x_ts_sample, x_scalar_sample)
+
+        # Get SE weights from the model (after explain call)
+        se_weights_list = model_explain.get_se_weights()
+        se_weights_np = []
+        if se_weights_list:
+            for weight_tensor in se_weights_list:
+                if weight_tensor is not None:
+                    w = weight_tensor[0].numpy() if weight_tensor.ndim > 1 else weight_tensor.numpy()
+                    se_weights_np.append(w)
+
+        # Retrieve raw data for visualization
+        raw_pressure = np.zeros(len(saliency), dtype=np.float32)
+        trig_inj = np.zeros(len(saliency), dtype=np.float32)
+        trig_hld = np.zeros(len(saliency), dtype=np.float32)
+        trig_cool = np.zeros(len(saliency), dtype=np.float32)
+
+        if cycle_id in raw_ts_cache:
+            cache_entry = raw_ts_cache[cycle_id]
+            raw_pressure = cache_entry["DXP_Inj1PrsAct"]
+            trig_inj = cache_entry["DXP_TrigInj1"]
+            trig_hld = cache_entry["DXP_TrigHld1"]
+            trig_cool = cache_entry["DXP_TrigCool"]
+
+        # Generate saliency plot
+        save_path = f"saliency_cycle_{cycle_id}.png"
+        plot_saliency_overlay(
+            raw_pressure=raw_pressure,
+            saliency=saliency,
+            trig_inj=trig_inj,
+            trig_hld=trig_hld,
+            trig_cool=trig_cool,
+            lbl_nok=int(y_test_full[local_idx]),
+            cycle_id=cycle_id,
+            se_weights_per_block=se_weights_np if se_weights_np else None,
+            save_path=save_path,
+        )
+
+        # Get predicted label
+        with torch.no_grad():
+            pred_logit = model_explain(x_ts_sample, x_scalar_sample).item()
+            pred_prob = torch.sigmoid(torch.tensor(pred_logit)).item()
+            pred_label = "DEFECTIVE" if pred_prob >= tcn_final_thr else "OK"
+
+        print(f"Saliency plot saved for cycle {cycle_id}, predicted defective={pred_label}, true label=DEFECTIVE")
+
+        # Compute saliency statistics
+        peak_idx = np.argmax(saliency)
+        peak_time_sec = peak_idx * 0.005
+        saliency_peak_times_sec.append(peak_time_sec)
+
+        # Phase-wise mean saliency
+        if trig_inj.sum() > 0:
+            saliency_inj_means.append(saliency[trig_inj > 0.5].mean())
+        if trig_hld.sum() > 0:
+            saliency_hld_means.append(saliency[trig_hld > 0.5].mean())
+        if trig_cool.sum() > 0:
+            saliency_cool_means.append(saliency[trig_cool > 0.5].mean())
+
+    # Print aggregate statistics
+    if saliency_peak_times_sec:
+        mean_peak_time = np.mean(saliency_peak_times_sec)
+        std_peak_time = np.std(saliency_peak_times_sec)
+        print(f"\nMean saliency peak time: {mean_peak_time:.4f} ± {std_peak_time:.4f} seconds")
+
+    if saliency_inj_means:
+        mean_inj = np.mean(saliency_inj_means)
+        print(f"Mean saliency during injection phase: {mean_inj:.4f}")
+    else:
+        mean_inj = 0.0
+
+    if saliency_hld_means:
+        mean_hld = np.mean(saliency_hld_means)
+        print(f"Mean saliency during holding phase: {mean_hld:.4f}")
+    else:
+        mean_hld = 0.0
+
+    if saliency_cool_means:
+        mean_cool = np.mean(saliency_cool_means)
+        print(f"Mean saliency during cooling phase: {mean_cool:.4f}")
+    else:
+        mean_cool = 0.0
+
+    # Determine and print dominant phase
+    phase_means = {
+        "Injection": mean_inj,
+        "Holding": mean_hld,
+        "Cooling": mean_cool,
+    }
+    dominant_phase = max(phase_means, key=phase_means.get)
+    print(f"The model primarily attended to the {dominant_phase} phase when predicting defects.")
 
 
 if __name__ == "__main__":

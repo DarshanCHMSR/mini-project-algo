@@ -1,51 +1,61 @@
 """
 GradCAM-based temporal saliency explainer for SE-GradCAM TCN.
 
-GradCAMExplainer registers hooks on the final TCNBlock to capture:
-  - forward: the output feature map (batch, channels, timesteps)
-  - backward: the gradient of the scalar output w.r.t. that feature map
-
-The gradient-weighted channel combination + ReLU produces a saliency curve
-that is causally valid because CausalConv1d uses left-only padding.
+Produces timestep-level heatmaps showing where the model attended when making
+predictions, aligned to injection molding process phases. Causally valid because
+the TCN uses left-only padding.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional
-
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 
 
 class GradCAMExplainer:
-    """Gradient-weighted Class Activation Map over the time axis of the final TCNBlock."""
+    """
+    Gradient-weighted Class Activation Mapping for TCN temporal saliency.
+
+    Hooks into the final TCNBlock to capture feature maps and gradients,
+    producing per-timestep saliency scores that indicate which time points
+    drove the model's prediction.
+    """
 
     def __init__(self, model):
+        """
+        Initialize explainer with a trained TCNDefectClassifier.
+
+        Args:
+            model: Trained TCNDefectClassifier instance.
+        """
         self.model = model
-        self.feature_map = None   # captured during forward pass
-        self.gradient = None      # captured during backward pass
-        self._forward_handle = None
-        self._backward_handle = None
+        self.feature_map = None  # Captured output from final TCNBlock
+        self.gradient = None     # Captured gradient w.r.t feature map
+        self._forward_handle = None   # Hook handle for forward pass
+        self._backward_handle = None  # Hook handle for backward pass
 
     def _register_hooks(self) -> None:
-        last_block = self.model.tcn_blocks[-1]  # hook only the final block for highest-level features
+        """Register forward and backward hooks on the final TCNBlock."""
+        # Access the final TCNBlock (last element of sequential)
+        last_block = self.model.tcn_blocks[-1]
 
         def forward_hook(module, input, output):
-            # output is the block's return value: (batch, channels, timesteps)
+            """Capture the output feature map during forward pass."""
             self.feature_map = output.detach()
 
         def backward_hook(module, grad_input, grad_output):
-            # grad_output[0]: gradient of loss w.r.t. this block's output
+            """Capture the gradient w.r.t. the feature map during backward."""
             self.gradient = grad_output[0].detach()
 
+        # Register hooks and store handles for cleanup
         self._forward_handle = last_block.register_forward_hook(forward_hook)
         self._backward_handle = last_block.register_full_backward_hook(backward_hook)
 
     def _remove_hooks(self) -> None:
-        """Always call after explain() to prevent dangling hook memory leaks."""
+        """Remove registered hooks to prevent memory leaks."""
         if self._forward_handle is not None:
             self._forward_handle.remove()
             self._forward_handle = None
@@ -55,39 +65,57 @@ class GradCAMExplainer:
 
     def explain(self, x_ts: torch.Tensor, x_scalar: torch.Tensor) -> np.ndarray:
         """
-        Compute GradCAM saliency for a single sample.
+        Compute GradCAM saliency for a single batch of samples.
+
+        Steps:
+        1) Register hooks on final TCNBlock
+        2) Forward pass to capture feature maps
+        3) Backward pass to capture gradients
+        4) Compute gradient-weighted channel combination
+        5) Normalize to [0, 1] per sample
+        6) Remove hooks and return
 
         Args:
-            x_ts:     (1, 8, T_max) — time-series input, must have requires_grad=True
-            x_scalar: (1, 5)        — scalar features
+            x_ts: Time-series input (batch, channels, timesteps)
+            x_scalar: Scalar features input (batch, n_scalar)
 
         Returns:
-            saliency: (T_max,) numpy array normalised to [0, 1]
+            Numpy array of shape (batch, timesteps) with saliency in [0, 1].
         """
+        # Register hooks
         self._register_hooks()
-        self.model.eval()          # eval mode — no dropout, no batch norm updates
+
+        # Set model to eval mode to disable dropout
+        self.model.eval()
+        # Clear any existing gradients
         self.model.zero_grad()
 
-        logit = self.model(x_ts, x_scalar)   # forward pass triggers forward_hook
-        logit.backward()                      # backward pass triggers backward_hook
+        # Forward pass and immediate backward to compute gradients
+        logit = self.model(x_ts, x_scalar)
+        logit.backward()
 
-        self._remove_hooks()  # clean up immediately — do not retain graph beyond this point
+        # Remove hooks to free memory
+        self._remove_hooks()
 
-        # Average gradient over channels → importance weight per timestep
-        # gradient shape: (batch, channels, timesteps) → weights: (batch, timesteps)
-        weights = self.gradient.mean(dim=1)
+        # Compute per-timestep saliency via gradient-weighted channel combination
+        # gradient shape: (batch, channels, timesteps)
+        # Average gradient over the channel dimension
+        weights = self.gradient.mean(dim=1)  # (batch, timesteps)
 
-        # Weighted sum of feature map channels: (batch, timesteps)
-        cam = (weights.unsqueeze(1) * self.feature_map).sum(dim=1)
+        # Multiply weights by feature maps and sum over channels
+        # feature_map shape: (batch, channels, timesteps)
+        cam = (weights.unsqueeze(1) * self.feature_map).sum(dim=1)  # (batch, timesteps)
 
-        cam = F.relu(cam)  # retain only positively contributing timesteps
+        # Apply ReLU to keep only positive contributions (attending regions)
+        cam = F.relu(cam)
 
-        # Normalise per sample to [0, 1] so plots are comparable across cycles
+        # Normalize per sample to [0, 1] along time axis
         cam_min = cam.min(dim=-1, keepdim=True).values
         cam_max = cam.max(dim=-1, keepdim=True).values
         cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
 
-        return cam.squeeze(0).numpy()  # (T_max,)
+        # Return as numpy, squeeze batch dimension for single sample
+        return cam.squeeze(0).cpu().numpy()
 
 
 def plot_saliency_overlay(
@@ -98,99 +126,187 @@ def plot_saliency_overlay(
     trig_cool: np.ndarray,
     lbl_nok: int,
     cycle_id: str,
-    se_weights_per_block: Optional[List[np.ndarray]] = None,
-    save_path: Optional[str] = None,
+    se_weights_per_block: list | None = None,
+    save_path: str | None = None,
 ) -> None:
     """
-    Produce a multi-panel saliency overlay figure for one injection cycle.
+    Plot GradCAM saliency overlaid with pressure signal and process phases.
 
-    Panel 1: Raw injection pressure with phase background shading.
-    Panel 2: GradCAM temporal saliency curve.
-    Panel 3 (optional): SE channel weights per TCN block as grouped bar chart.
+    Creates multi-panel visualization showing:
+    - Panel 1: Raw pressure with phase backgrounds
+    - Panel 2: GradCAM saliency heatmap
+    - Panel 3 (optional): SE channel weights per block
+
+    Args:
+        raw_pressure: DXP_Inj1PrsAct values (bar), shape (T,)
+        saliency: GradCAM saliency [0-1], shape (T,)
+        trig_inj: Injection phase boolean flags, shape (T,)
+        trig_hld: Holding phase boolean flags, shape (T,)
+        trig_cool: Cooling phase boolean flags, shape (T,)
+        lbl_nok: True label (0=OK, 1=DEFECTIVE)
+        cycle_id: Cycle identifier string for plot title
+        se_weights_per_block: Optional list of SE weights, one per block, each shape (n_channels,)
+        save_path: Optional file path to save figure (e.g., "plot.png")
     """
+    # Determine number of subplots: 2 if no SE weights, 3 with SE weights
     n_rows = 3 if se_weights_per_block is not None else 2
-    fig, axes = plt.subplots(n_rows, 1, figsize=(14, 4 * n_rows), sharex=True)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(14, 3 * n_rows), sharex=True)
 
-    # Time axis in seconds: DXP signals sampled at 200 Hz → 0.005 s per step
-    t = np.arange(len(raw_pressure)) * 0.005
+    if n_rows == 2:
+        ax_pressure, ax_saliency = axes
+    else:
+        ax_pressure, ax_saliency, ax_se = axes
 
-    label_text = "DEFECTIVE (LBL_NOK=1)" if lbl_nok == 1 else "OK (LBL_NOK=0)"
-    label_color = "red" if lbl_nok == 1 else "green"
-    fig.suptitle(f"Cycle {cycle_id} — {label_text}", color=label_color, fontsize=13, fontweight="bold")
+    # Convert timestep indices to seconds (200 Hz sampling = 0.005 s per step)
+    time_seconds = np.arange(len(raw_pressure)) * 0.005
 
-    # Phase colour constants used across all panels
-    PHASE_COLORS = {
-        "inj":  ("#3498DB", 0.12, "Injection"),
-        "hld":  ("#E67E22", 0.12, "Holding"),
-        "cool": ("#27AE60", 0.12, "Cooling"),
+    # Define phase colors and labels for legend
+    phase_colors = {
+        'injection': '#3498DB',    # blue
+        'holding': '#E67E22',      # orange
+        'cooling': '#27AE60',      # green
     }
 
-    def _shade_phases(ax):
-        """Apply phase background shading using axes-fraction y coordinates."""
-        xform = ax.get_xaxis_transform()
-        ax.fill_between(t, 0, 1, where=trig_inj.astype(bool),
-                        color=PHASE_COLORS["inj"][0], alpha=PHASE_COLORS["inj"][1],
-                        transform=xform, label="_nolegend_")
-        ax.fill_between(t, 0, 1, where=trig_hld.astype(bool),
-                        color=PHASE_COLORS["hld"][0], alpha=PHASE_COLORS["hld"][1],
-                        transform=xform, label="_nolegend_")
-        ax.fill_between(t, 0, 1, where=trig_cool.astype(bool),
-                        color=PHASE_COLORS["cool"][0], alpha=PHASE_COLORS["cool"][1],
-                        transform=xform, label="_nolegend_")
+    # Helper function to add phase background shading
+    def add_phase_backgrounds(ax, time_s, trig_i, trig_h, trig_c):
+        """Add fill_between backgrounds for each phase."""
+        # Injection phase background
+        ax.fill_between(
+            time_s,
+            0, 1,
+            where=trig_i > 0.5,
+            color=phase_colors['injection'],
+            alpha=0.12,
+            transform=ax.get_xaxis_transform(),
+            label='_Injection',
+        )
+        # Holding phase background
+        ax.fill_between(
+            time_s,
+            0, 1,
+            where=trig_h > 0.5,
+            color=phase_colors['holding'],
+            alpha=0.12,
+            transform=ax.get_xaxis_transform(),
+            label='_Holding',
+        )
+        # Cooling phase background
+        ax.fill_between(
+            time_s,
+            0, 1,
+            where=trig_c > 0.5,
+            color=phase_colors['cooling'],
+            alpha=0.12,
+            transform=ax.get_xaxis_transform(),
+            label='_Cooling',
+        )
 
-    # ── Panel 1: Raw pressure ──────────────────────────────────────────────
-    ax1 = axes[0]
-    _shade_phases(ax1)
-    pressure_line, = ax1.plot(t, raw_pressure, color="#2C3E50", linewidth=1.2, label="Pressure")
-    ax1.set_ylabel("Pressure (bar)")
-    ax1.grid(alpha=0.3)
+    # =========================================================================
+    # Panel 1: Pressure signal with phase backgrounds
+    # =========================================================================
+    add_phase_backgrounds(ax_pressure, time_seconds, trig_inj, trig_hld, trig_cool)
+    ax_pressure.plot(time_seconds, raw_pressure, color='#2C3E50', linewidth=1.2, label='Pressure')
+    ax_pressure.set_ylabel('Pressure (bar)')
+    ax_pressure.grid(alpha=0.3)
 
-    # Legend: phase patches + pressure line
-    legend_handles = [
-        mpatches.Patch(color=PHASE_COLORS["inj"][0],  alpha=0.5, label="Injection"),
-        mpatches.Patch(color=PHASE_COLORS["hld"][0],  alpha=0.5, label="Holding"),
-        mpatches.Patch(color=PHASE_COLORS["cool"][0], alpha=0.5, label="Cooling"),
-        pressure_line,
+    # Create legend with phase patches + pressure line
+    phase_patches = [
+        Patch(facecolor=phase_colors['injection'], alpha=0.12, label='Injection'),
+        Patch(facecolor=phase_colors['holding'], alpha=0.12, label='Holding'),
+        Patch(facecolor=phase_colors['cooling'], alpha=0.12, label='Cooling'),
     ]
-    ax1.legend(handles=legend_handles, loc="upper right", fontsize=8)
+    ax_pressure.legend(handles=phase_patches, loc='upper right')
 
-    # ── Panel 2: GradCAM saliency ──────────────────────────────────────────
-    ax2 = axes[1]
-    _shade_phases(ax2)
-    ax2.fill_between(t, 0, saliency, color="#E74C3C", alpha=0.4)
-    ax2.plot(t, saliency, color="#C0392B", linewidth=1.5)
-    ax2.set_ylabel("Saliency (0-1)")
-    ax2.set_ylim(0, 1.05)
-    ax2.set_title("GradCAM Temporal Saliency — where the model attended", fontsize=10)
-    ax2.grid(alpha=0.3)
+    # =========================================================================
+    # Panel 2: GradCAM saliency
+    # =========================================================================
+    add_phase_backgrounds(ax_saliency, time_seconds, trig_inj, trig_hld, trig_cool)
+    ax_saliency.fill_between(
+        time_seconds,
+        saliency,
+        color='#E74C3C',
+        alpha=0.4,
+        label='Saliency'
+    )
+    ax_saliency.plot(time_seconds, saliency, color='#C0392B', linewidth=1.5)
+    ax_saliency.set_ylabel('Saliency (0-1)')
+    ax_saliency.set_ylim(0, 1.05)
+    ax_saliency.set_title('GradCAM Temporal Saliency — where the model attended')
+    ax_saliency.grid(alpha=0.3)
 
-    # ── Panel 3: SE channel weights (optional) ─────────────────────────────
-    if se_weights_per_block is not None:
-        ax3 = axes[2]
+    # =========================================================================
+    # Panel 3: SE channel weights (if provided)
+    # =========================================================================
+    if se_weights_per_block is not None and len(se_weights_per_block) > 0:
         channel_names = [
-            "DXP Pressure", "DXP Position", "TCE Temp", "TCN Temp",
-            "DOS Rate", "Trig Injection", "Trig Holding", "Trig Cooling",
+            'DXP Pressure',
+            'DXP Position',
+            'TCE Temp',
+            'TCN Temp',
+            'DOS Rate',
+            'Trig Injection',
+            'Trig Holding',
+            'Trig Cooling',
         ]
+
+        # Prepare data for grouped bar chart
         n_channels = len(channel_names)
         n_blocks = len(se_weights_per_block)
-        bar_height = 0.8 / n_blocks          # divide available height among blocks
-        y_base = np.arange(n_channels)
-        block_colors = plt.cm.tab10(np.linspace(0, 0.9, n_blocks))
+        x_pos = np.arange(n_channels)
+        bar_width = 0.8 / n_blocks  # divide width equally among blocks
 
-        for b_idx, (weights, color) in enumerate(zip(se_weights_per_block, block_colors)):
-            offsets = y_base + b_idx * bar_height - (n_blocks - 1) * bar_height / 2
-            ax3.barh(offsets, weights[:n_channels], height=bar_height * 0.9,
-                     color=color, label=f"Block {b_idx + 1}")
+        # Color palette for blocks
+        colors = plt.cm.Set3(np.linspace(0, 1, n_blocks))
 
-        ax3.set_yticks(y_base)
-        ax3.set_yticklabels(channel_names, fontsize=8)
-        ax3.set_title("SE Channel Weights — which sensors the model weighted per block", fontsize=10)
-        ax3.legend(loc="lower right", fontsize=8)
+        for block_idx, se_weights in enumerate(se_weights_per_block):
+            # se_weights shape: (batch, n_channels) or (n_channels,)
+            if se_weights.ndim == 2:
+                se_weights = se_weights[0]  # Take first sample
+            se_weights_np = se_weights.cpu().numpy() if torch.is_tensor(se_weights) else se_weights
 
-    axes[-1].set_xlabel("Time (seconds)")
+            offset = (block_idx - n_blocks / 2 + 0.5) * bar_width
+            ax_se.barh(
+                x_pos + offset,
+                se_weights_np,
+                bar_width,
+                label=f'Block {block_idx + 1}',
+                color=colors[block_idx],
+            )
+
+        ax_se.set_yticks(x_pos)
+        ax_se.set_yticklabels(channel_names)
+        ax_se.set_xlabel('SE Weight')
+        ax_se.set_title('SE Channel Weights — which sensors the model weighted per block')
+        ax_se.legend(loc='lower right')
+        ax_se.grid(alpha=0.3, axis='x')
+
+    # =========================================================================
+    # Figure title with label coloring
+    # =========================================================================
+    if lbl_nok == 1:
+        label_text = 'DEFECTIVE (LBL_NOK=1)'
+        label_color = 'red'
+    else:
+        label_text = 'OK (LBL_NOK=0)'
+        label_color = 'green'
+
+    fig.suptitle(
+        f'Cycle {cycle_id} — {label_text}',
+        fontsize=14,
+        fontweight='bold',
+        color=label_color,
+    )
+
+    # Set x-axis label only on the bottom panel
+    if n_rows == 2:
+        ax_saliency.set_xlabel('Time (seconds)')
+    else:
+        ax_se.set_xlabel('Time (seconds)')
+
     plt.tight_layout()
 
+    # Save if path provided
     if save_path is not None:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
 
     plt.show()

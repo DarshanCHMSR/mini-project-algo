@@ -1,5 +1,10 @@
 """
-One-command entrypoint for reproducible training.
+One-command entrypoint for reproducible SE-GradCAM TCN training.
+
+SE-GradCAM TCN — Explainable Defect Prediction for Injection Moulding
+
+Receptive field = 1 + (kernel_size - 1) x sum(dilations)
+             = 1 + (3-1) x (1+2+4) = 15 timesteps
 
 Usage:
   python run_training.py
@@ -21,7 +26,15 @@ REQUIRED_MODULES = {
     "pyarrow": "pyarrow",
     "sklearn": "scikit-learn",
     "torch": "torch",
+    "matplotlib": "matplotlib",
 }
+
+REQUIRED_FILES = [
+    "tcn_model.py",
+    "preprocess.py",
+    "train.py",
+    "explainer.py",
+]
 
 
 def _missing_modules() -> dict[str, str]:
@@ -46,8 +59,18 @@ def _check_dataset_exists() -> None:
         )
 
 
+def _check_required_files() -> None:
+    """Verify all required source files exist."""
+    for filename in REQUIRED_FILES:
+        filepath = Path(filename)
+        if not filepath.exists():
+            raise FileNotFoundError(
+                f"Required file '{filename}' not found in project root."
+            )
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run TCN training with dependency checks.")
+    parser = argparse.ArgumentParser(description="Run SE-GradCAM TCN training with dependency checks.")
     parser.add_argument(
         "--install-missing",
         action="store_true",
@@ -55,6 +78,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Print startup banner
+    print("=" * 70)
+    print("SE-GradCAM TCN — Explainable Defect Prediction for Injection Moulding")
+    print("=" * 70)
+    print("\nReceptive field = 1 + (kernel_size - 1) x sum(dilations)")
+    print("             = 1 + (3-1) x (1+2+4) = 15 timesteps\n")
+
+    # Check for missing dependencies
     missing = _missing_modules()
     if missing:
         packages = sorted(set(missing.values()))
@@ -70,9 +101,23 @@ def main() -> None:
             print("  python run_training.py --install-missing")
             sys.exit(1)
 
-    _check_dataset_exists()
+    # Check for required source files
+    try:
+        _check_required_files()
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
 
-    # Import only after checks pass.
+    # Check for dataset
+    try:
+        _check_dataset_exists()
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+    print("All checks passed. Starting training...\n")
+
+    # Import only after checks pass
     from train import main as train_main
 
     train_main()
