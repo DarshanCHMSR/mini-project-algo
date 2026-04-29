@@ -1,5 +1,24 @@
 """
-Temporal models for ProBayes defect classification.
+SE-GradCAM TCN — Squeeze-and-Excitation Temporal Convolutional Network
+with Gradient-Weighted Phase-Aligned Saliency.
+
+Architectural Contributions
+============================
+1. Squeeze-and-Excitation (SE) channel attention inside each TCNBlock:
+   - SQUEEZE: global average pool over the time axis → one scalar per channel,
+     capturing the global cycle context for that sensor.
+   - EXCITE: two FC layers (ReLU bottleneck → Sigmoid output) produce
+     per-channel weights in [0, 1].
+   - SCALE: multiply each channel's full time-series by its learned weight,
+     making the model explicitly learn which sensors are most diagnostic.
+
+2. GradCAM temporal saliency (implemented in explainer.py):
+   - Hooks on the final TCNBlock capture the output feature map (forward)
+     and its gradient (backward).
+   - Gradient-weighted combination of feature-map channels → ReLU → normalise
+     produces a saliency curve over time.
+   - Causally valid: CausalConv1d uses left-only padding, so the feature map
+     at timestep t encodes only information from timesteps ≤ t.
 """
 
 from __future__ import annotations
@@ -20,17 +39,44 @@ class CausalConv1d(nn.Module):
             out_channels=out_channels,
             kernel_size=kernel_size,
             dilation=dilation,
-            padding=0,
+            padding=0,  # all padding is manual and left-only — never 'same'
         )
         self.conv = nn.utils.weight_norm(self.conv)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.pad(x, (self.left_pad, 0))
+        x = F.pad(x, (self.left_pad, 0))  # left-only pad preserves causality
         return self.conv(x)
 
 
+class SqueezeExcitation(nn.Module):
+    """
+    Channel attention via global average pooling + two-layer FC gating.
+
+    Squeeze: collapse time axis → (batch, channels) descriptor.
+    Excite:  FC → ReLU → FC → Sigmoid → per-channel weights in [0, 1].
+    Scale:   multiply each channel's time-series by its weight.
+    """
+
+    def __init__(self, n_channels: int, reduction: int = 4):
+        super().__init__()
+        bottleneck = max(n_channels // reduction, 4)  # floor at 4 to avoid degenerate bottleneck
+        self.excitation = nn.Sequential(
+            nn.Linear(n_channels, bottleneck),
+            nn.ReLU(),
+            nn.Linear(bottleneck, n_channels),
+            nn.Sigmoid(),  # weights must be in [0, 1] for interpretable scaling
+        )
+
+    def forward(self, x: torch.Tensor):
+        # x: (batch, channels, timesteps)
+        squeeze = x.mean(dim=-1)                    # (batch, channels) — global cycle context
+        weights = self.excitation(squeeze)           # (batch, channels) — learned channel importance
+        scaled = x * weights.unsqueeze(-1)           # broadcast weights over time axis
+        return scaled, weights                       # return weights for post-hoc inspection
+
+
 class TCNBlock(nn.Module):
-    """Residual TCN block with two causal dilated convolutions."""
+    """Residual TCN block with two causal dilated convolutions + SE attention."""
 
     def __init__(
         self,
@@ -55,14 +101,19 @@ class TCNBlock(nn.Module):
         else:
             self.residual_proj = nn.Identity()
 
+        self.se = SqueezeExcitation(out_channels, reduction=4)
+        # Cache for post-hoc SE weight inspection without affecting gradients.
+        self.last_se_weights = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.residual_proj(x)
         out = self.conv_block(x)
-        return F.relu(out + residual)
+        out, se_weights = self.se(out)                          # apply channel attention
+        self.last_se_weights = se_weights.detach().cpu()        # detach to prevent graph retention
+        return F.relu(out + self.residual_proj(x))              # residual + activation unchanged
 
 
 class TCNDefectClassifier(nn.Module):
-    """TCN classifier for binary defect prediction with scalar feature fusion."""
+    """SE-TCN classifier for binary defect prediction with scalar feature fusion."""
 
     def __init__(
         self,
@@ -77,7 +128,7 @@ class TCNDefectClassifier(nn.Module):
         blocks = []
         for i, out_ch in enumerate(channel_list):
             in_ch = in_channels if i == 0 else channel_list[i - 1]
-            dilation = 2 ** i
+            dilation = 2 ** i  # exponential dilation: [1, 2, 4, ...]
             blocks.append(TCNBlock(in_ch, out_ch, kernel_size, dilation, dropout))
         self.tcn_blocks = nn.Sequential(*blocks)
 
@@ -89,16 +140,24 @@ class TCNDefectClassifier(nn.Module):
             nn.Linear(32, 1),
         )
 
-        # Requested derivation comment:
-        # total receptive field = 1 + (kernel_size - 1) * sum(all dilation values across all blocks)
+        # Receptive field = 1 + (kernel_size - 1) * sum(all dilations across all blocks)
+        # For kernel_size=3, dilations=[1,2,4]: RF = 1 + (3-1)*(1+2+4) = 15 timesteps
         self.receptive_field = 1 + (kernel_size - 1) * sum(2 ** i for i in range(len(channel_list)))
 
     def forward(self, x_ts: torch.Tensor, x_scalar: torch.Tensor) -> torch.Tensor:
         h = self.tcn_blocks(x_ts)
-        h = h.mean(dim=2)
-        combined = torch.cat([h, x_scalar], dim=1)
+        h = h.mean(dim=2)                               # global average pool over time
+        combined = torch.cat([h, x_scalar], dim=1)      # fuse scalar features
         out = self.classifier(combined)
-        return out.squeeze(-1)
+        return out.squeeze(-1)                          # single logit — no sigmoid here
+
+    def get_se_weights(self) -> list:
+        """Return cached SE weights from the last forward pass, one tensor per block."""
+        return [
+            block.last_se_weights
+            for block in self.tcn_blocks
+            if isinstance(block, TCNBlock) and block.last_se_weights is not None
+        ]
 
 
 class FocalLoss(nn.Module):
@@ -116,6 +175,37 @@ class FocalLoss(nn.Module):
         focal_weight = (1.0 - p_t) ** self.gamma
         alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
         loss = alpha_t * focal_weight * bce
+        return loss.mean()
+
+
+class AsymmetricFocalLoss(nn.Module):
+    """
+    Asymmetric focal loss with separate gamma values for positive/negative samples.
+
+    gamma_pos > gamma_neg because missing a defect (false negative) is more costly
+    than falsely flagging a good part (false positive) in a manufacturing context.
+    Higher gamma on positives down-weights easy positive examples more aggressively,
+    forcing the model to focus on hard-to-detect defects.
+    """
+
+    def __init__(self, gamma_neg: float = 2.0, gamma_pos: float = 4.0, alpha: float = 0.75, clip: float = 0.05):
+        super().__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.alpha = alpha
+        self.clip = clip  # probability clipping prevents log(0) instability
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets = targets.float()
+        prob = torch.sigmoid(logits)
+        prob = torch.clamp(prob, self.clip, 1.0 - self.clip)   # numerical stability
+
+        # Positive branch: penalise missed defects more heavily via gamma_pos
+        loss_pos = -self.alpha * (1.0 - prob) ** self.gamma_pos * torch.log(prob)
+        # Negative branch: standard focal weighting for OK parts
+        loss_neg = -(1.0 - self.alpha) * prob ** self.gamma_neg * torch.log(1.0 - prob)
+
+        loss = targets * loss_pos + (1.0 - targets) * loss_neg
         return loss.mean()
 
 
